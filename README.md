@@ -13,3 +13,4 @@ Todo
 - Package properly
 - Automate more
 - Move replacements to user config?
+- Make it work on all the DVDs!
