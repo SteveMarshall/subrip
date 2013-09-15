@@ -9,12 +9,6 @@ use Pod::Usage;
 use Web::Scraper;
 use XML::Simple;
 
-# TODO: Check for required executables using `which`?
-# TODO: Package properly
-# Requires:
-# cpanm Image::Magick Web::Scraper
-# brew install imagemagick dvdauthor dvdbackup netpbm tesseract --all-languages
-
 use constant OPTIONS => qw(
        colour-mask|c=i
        only-forced|f
