@@ -1,0 +1,317 @@
+#!/usr/bin/env perl
+
+use warnings;
+use strict;
+use Data::Dumper;
+use Getopt::Long    qw( :config bundling );
+use Image::Magick;
+use Pod::Usage;
+use Web::Scraper;
+use XML::Simple;
+
+# TODO: Check for required executables using `which`?
+# TODO: Package properly
+# Requires:
+# cpanm Image::Magick Web::Scraper
+# brew install imagemagick dvdauthor dvdbackup netpbm tesseract --all-languages
+
+use constant OPTIONS => qw(
+       colour-mask|c=i
+       only-forced|f
+              help|h
+          language|l=s
+    subtitle-track|s=i
+         dvd-title|t=i
+            untidy|u
+           verbose|v
+);
+
+my %option   = get_options_or_exit();
+
+# Extract subtitles and control XML from VOBs
+if ( ($#ARGV + 1) <= 0 and !-e "sub.xml" ) {
+    pod2usage();
+}
+elsif (!-e "sub.xml" and (0 <= ($#ARGV + 1))) {
+    my $file_match = $ARGV[0];
+    my $title = $option{'dvd-title'} || 1;
+    if ( !-e "tmp/VIDEO_TS/" ) {
+      print STDERR "Extracting title ${title} from DVD\n";
+      system( qq(dvdbackup -i ${file_match} -o . -n tmp -t ${title} 2>/dev/null) );
+    }
+    my $stream = $option{'subtitle-track'} || 0;
+    print STDERR "Extracting subtitles from stream ${stream}\n";
+    system( qq(spuunmux -s ${stream} tmp/VIDEO_TS/*.VOB 2>/dev/null) );
+}
+
+# Identify subtitle colour palette so we can replace it
+my @subimages = glob "sub*.png";
+my ($test_subimage, @original_colours);
+if ( 0 < $#subimages ) {
+    $test_subimage = $subimages[0];
+    @original_colours = find_original_colours($test_subimage);
+}
+else {
+    exit;
+}
+
+my %masks = (
+    "0001" => 1,
+    "0010" => 1,
+    "0100" => 1,
+    "1000" => 1,
+);
+
+# Generate test images if no colour mask is set
+unless ( defined $test_subimage
+     and defined $option{'colour-mask'}
+     and defined $masks{$option{'colour-mask'}} ) {
+    print STDERR "Generating test images using ${test_subimage}\n";
+
+    foreach my $pattern (keys %masks) {
+        mask_image($test_subimage, \@original_colours, $pattern, "${pattern}.png");
+    }
+    
+    my $mask_files = join(".png, ", keys %masks);
+    print STDERR "Check the masking test files (${mask_files}.png) and run\n"
+               . "subrip [-f] -c <mask_number>\n";
+    exit;
+}
+
+# Combine OCR'd subimages using sub.xml timings/forcings into SRT
+my $subxml = XML::Simple->new()->XMLin("sub.xml");
+my $subtitles = $subxml->{stream}->{spu};
+die 'No subtitles!' unless ref($subtitles) eq 'ARRAY';
+
+my $i = 1;
+foreach my $sub (@{$subtitles}) {
+    # Skip subs with no image or times
+    next unless (defined $sub->{'image'} and defined $sub->{"start"} and defined $sub->{"end"});
+    
+    # If we only want forced images, skip anything that isn't forced
+    if ( $option{'only-forced'} ) {
+        next unless defined $sub->{'force'} and "yes" eq $sub->{'force'};
+    }
+    
+    my $image_name = $sub->{'image'};
+    if (!-e $image_name) {
+        print STDERR "Couldn't find $image_name; skipping.\n";
+        next;
+    }
+    print STDERR "$image_name\n";
+    my $ocr_image = $image_name;
+       $ocr_image =~ s/\.png/.msk.png/;
+    
+    # Mask the subimage to black and white to make OCR easier
+    my $mask = $option{'colour-mask'};
+    mask_image($image_name, \@original_colours, $option{'colour-mask'}, $ocr_image);
+    
+    my $text = get_ocr($ocr_image, $option{'language'});
+    
+    # Convert times to SRT format (HH:MM:SS,mmm instead of HH:MM:SS.mmm)
+    my $start = $sub->{"start"} . "0";
+       $start =~ s/.(\d+)$/,$1/;
+    my $end = $sub->{"end"} . "0";
+       $start =~ s/.(\d+)$/,$1/;
+    
+    print STDERR "Converting $image_name to SRT\n" if $option{'verbose'};
+    print <<SRT;
+${i}
+${start} --> ${end}
+${text}
+
+SRT
+
+    if (!defined $option{'untidy'}) {
+        unlink $ocr_image;
+        unlink "$ocr_image.html";
+    }
+    $i++;
+}
+
+sub find_original_colours {
+    my $image_path = shift;
+    
+    my $image = Image::Magick->new;
+    $image->Read($image_path);
+    my @histogram = $image->Histogram();
+    use Data::Dumper;
+
+    my($red, $green, $blue, $transparency, $count);
+
+    my @original_colours = ();
+    while (@histogram) {
+        # Generate hex RGBA colours
+        ($red, $green, $blue, $transparency, $count) = splice(@histogram, 0, 5);
+        
+        # Histogram returns transparency, not opacity for some odd reason
+        my $opacity = 0xffff - $transparency;
+        
+        # $image->Histogram() gives 64-bit colours, so use #rrrrggggbbbbaaaa
+        # colour format to avoid rounding errors during replacement.
+        push(@original_colours, sprintf(
+            "#%04x%04x%04x%04x",
+            $red, $green, $blue, $opacity
+        ));
+    }
+    
+    return @original_colours;
+}
+
+sub mask_image {
+    my $image_path           = shift;
+    my $original_colours_ref = shift;
+    my @original_colours     = @$original_colours_ref;
+    my $mask                 = shift;
+    my $output_file          = shift || $image_path;
+    
+    unless (-e "${output_file}.png") {
+        print STDERR "Masking ${image_path} with $mask\n" if $option{'verbose'};
+        my $image = Image::Magick->new;
+        $image->Read($image_path);
+        
+        # Swap each colour for either white or black, depending on $mask
+        for (my $i = 0; $i <= $#original_colours; $i++) {
+            my $original_colour = $original_colours[$i];
+            my $is_black = substr($mask, $i, 1);
+            my $new_colour = (("1" eq $is_black) ? "#000" : "#fff");
+            $image->Opaque(color=>$original_colour,fill=>$new_colour);
+        }
+        
+        # Remove unnecessary alpha and save
+        $image->Set(alpha=>"Off");
+        $image->Write($output_file);
+        undef $image;
+    }
+}
+
+sub get_ocr {
+    my $image = shift;
+    my $lang  = shift;
+    
+    # Generate hOCR file if it doesn't exist
+    unless (-e "${image}.html") {
+        print STDERR "OCRing ${image}\n" if $option{'verbose'};
+        my $cmd = qq(tesseract "${image}" "${image}" -l ${lang} hocr 2>/dev/null);
+        system( $cmd );
+    }
+    
+    # Suck in the hOCR HTML
+    open(FILE,'<', "${image}.html") or die("Can't open OCR file '${image}.html', $!");
+    local $/;
+    my $html = <FILE>;
+    close FILE;
+    
+    # Grab hOCR lines and words
+    print STDERR "Scraping ${image}\n" if $option{'verbose'};
+    my $lines = scraper {
+        process ".ocr_line", "lines[]" => scraper {
+            process ".ocrx_word", "words[]" => 'raw'
+        }
+    };
+    my $res = $lines->scrape($html);
+    
+    # Re-render OCR'd text without all the HTML crap
+    my @lines = ();
+    for my $line (@{$res->{lines}}) {
+        my @words = ();
+        for my $word (@{$line->{words}}) {
+            push @words, "${word}"
+        }
+        push @lines, join ' ', @words
+    }
+    
+    my $result = join "\n", @lines;
+    # Clean up common OCR issues for SRT use
+    # TODO: Make this extensible via config?
+       $result =~ s/em>/i>/g;
+       $result =~ s/<i>(\W)<\/i>/$1/g;
+       $result =~ s/<(\/)?strong>//g;
+       $result =~ s/<\/(i)>(\s+)<\1>/$2/g;
+       $result =~ s/&apos;/’/g;
+       $result =~ s/&quot;/'/g;
+       $result =~ s/\.\.\./…/g;
+    
+    return $result;
+}
+
+sub get_options_or_exit {
+    my %getopts = @_;
+    
+    my @options = ( OPTIONS );
+    my $known   = GetOptions( \%getopts, @options );
+    my $usage   = ! $known || $getopts{'help'};
+    
+    if ( $getopts{'colour-mask'} ) {
+        $getopts{'colour-mask'} = sprintf( "%04d", $getopts{'colour-mask'});
+    }
+    if ( !defined $getopts{'language'} ) {
+        $getopts{'language'} = 'eng';
+    }
+    
+    pod2usage() if $usage;
+    
+    return %getopts;
+}
+
+__END__
+
+=head1 NAME
+
+subrip - Extract subtitles from VOB files and use OCR to make a .srt of them
+
+=head1 SYNOPSIS
+
+    subrip [-s<subtitle_number>] <dvd_dir>
+    subrip [-f] -c <mask_number>
+
+The first form extracts subtitle images and their XML control file from the DVD
+and generates four test mask images. The second form takes a mask number,
+applies OCR to all the subtitle images to extract the text, and outputs the
+SubRip formatted subtitles to STDOUT.
+
+=head1 OPTIONS
+
+=over
+
+=item -sI<subtitle_number>, --subtitle-track I<subtitle_number>
+
+When extracting subtitle information from DVD VOB files, extract subtitle track
+I<subtitle_number>. Defaults to 0 (first subtitle track).
+
+=item -cI<mask_number>, --colour-mask I<mask_number>
+
+Identifies the colour mask to use when performing OCR on subtitle images. The
+appropriate I<mask_number> is the name of whichever mask test image (named
+0001.png, 0010.png, 0100.png, and 1000.png) shows black text on a white
+background.
+
+=item -f, --only-forced
+
+Only output "forced" subtitles. This is typically useful when two languages are used in the audio, and the DVD "forces" primary-language subtitles for the non-primary-language audio portions of the video.
+
+=item -lI<language>, --language I<language>
+
+Select the language Tesseract should use to identify the text. Defaults to eng.
+
+=item -u, --untidy
+
+Don't remove intermediate PNGs and HTML files used for OCR. Useful
+for debugging.
+
+=item -v, --verbose
+
+Include more information in the output.
+
+=back
+
+=head1 AUTHOR
+
+Steve Marshall, L<steve@nascentguruism.com>.
+
+=head1 COPYRIGHT AND LICENSE
+
+Copyright 2013 Steve Marshall.
+
+This library is free software; you can redistribute it and/or modify it
+under the same terms as Perl itself.
