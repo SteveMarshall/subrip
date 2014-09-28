@@ -29,13 +29,13 @@ if ( ($#ARGV + 1) <= 0 and !-e "sub.xml" ) {
 elsif (!-e "sub.xml" and (0 <= ($#ARGV + 1))) {
     my $file_match = $ARGV[0];
     my $title = $option{'dvd-title'} || 1;
-    if ( !-e "tmp/VIDEO_TS/" ) {
+    if ( !-e "extracted_title/VIDEO_TS/" ) {
       print STDERR "Extracting title ${title} from DVD\n";
-      system( qq(dvdbackup -i ${file_match} -o . -n tmp -t ${title} 2>/dev/null) );
+      system( qq(dvdbackup -i ${file_match} -o . -n extracted_title -t ${title} 2>/dev/null) );
     }
     my $stream = $option{'subtitle-track'} || 0;
     print STDERR "Extracting subtitles from stream ${stream}\n";
-    system( qq(spuunmux -s ${stream} tmp/VIDEO_TS/*.VOB 2>/dev/null) );
+    system( qq(spuunmux -s ${stream} extracted_title/VIDEO_TS/*.VOB 2>/dev/null) );
 }
 
 # Identify subtitle colour palette so we can replace it
